@@ -12,6 +12,7 @@
     <link rel="icon" type="image/svg+xml" href="/assets/frikimusic-logo-v2.svg" />
     <link rel="apple-touch-icon" href="/assets/app-icon-round.png" />
     <link rel="stylesheet" href="/styles.css" />
+    <script src="/config.js"></script>
     <script type="module" src="/app.js"></script>
   </head>
   <body>
@@ -84,6 +85,7 @@
       </nav>
     </div>
 
+    <audio id="audioPlayer" preload="none" crossorigin="anonymous"></audio>
     <div class="full-player" id="fullPlayer" aria-hidden="true"></div>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
   </body>
