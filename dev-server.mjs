@@ -31,6 +31,13 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (pathname === '/config.js') {
+    const apiUrl = process.env.FRIKIMUSIC_API_URL || 'http://127.0.0.1:3100';
+    response.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+    response.end(`window.FRIKIMUSIC_API_URL = ${JSON.stringify(apiUrl)};\n`);
+    return;
+  }
+
   if (pathname === '/') pathname = '/index.html';
   const filePath = path.resolve(root, `.${pathname}`);
   if (filePath !== root && !filePath.startsWith(`${root}${path.sep}`)) {
