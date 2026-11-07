@@ -1,6 +1,11 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
+  "functions": {
+    "api/frikimusic/[...path].js": {
+      "maxDuration": 300
+    }
+  },
   "cleanUrls": true,
   "trailingSlash": false
 }
