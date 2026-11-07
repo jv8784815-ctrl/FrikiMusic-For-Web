@@ -100,6 +100,19 @@ const remoteTracks = new Map();
 const remoteArtists = new Map();
 const coverTones = ['plum', 'rose', 'blue', 'amber', 'mint', 'violet', 'berry', 'night'];
 
+async function fetchApiJson(path) {
+  const response = await fetch(`${apiBase}${path}`);
+  const content = await response.text();
+  let data;
+  try {
+    data = content ? JSON.parse(content) : {};
+  } catch {
+    throw new Error(`La API respondió ${response.status} con un mensaje inesperado: ${content.slice(0, 120)}`);
+  }
+  if (!response.ok) throw new Error(data.error || `La API respondió con error ${response.status}.`);
+  return data;
+}
+
 function durationText(seconds) {
   const minutes = Math.floor(seconds / 60);
   const remainder = Math.floor(seconds % 60).toString().padStart(2, '0');
@@ -257,9 +270,7 @@ async function loadSearchResults(query) {
   state.searchError = '';
   renderPage();
   try {
-    const response = await fetch(`${apiBase}/api/frikimusic/search?q=${encodeURIComponent(query.trim())}`);
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || 'La búsqueda no respondió.');
+    const data = await fetchApiJson(`/api/frikimusic/search?q=${encodeURIComponent(query.trim())}`);
     if (request !== state.searchRequest) return;
     state.searchSongs = (data.songs || []).map(normalizeTrack).filter(Boolean);
     state.searchArtists = (data.artists || []).map(normalizeArtist).filter(Boolean);
@@ -333,9 +344,7 @@ async function loadArtist(id) {
   state.artistLoading = true;
   renderPage();
   try {
-    const response = await fetch(`${apiBase}/api/frikimusic/artist/${encodeURIComponent(id)}`);
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || 'No se pudo cargar este perfil.');
+    const data = await fetchApiJson(`/api/frikimusic/artist/${encodeURIComponent(id)}`);
     if (request !== state.artistRequest || state.artistId !== id) return;
     const details = data.artist || data;
     const artist = normalizeArtist({ ...remoteArtists.get(id), ...details, id }, remoteArtists.size);
@@ -489,9 +498,7 @@ async function findAndPlay(sample) {
   showToast(`Buscando “${sample.title}” para reproducir…`);
   try {
     const query = `${sample.title} ${sample.artist}`;
-    const response = await fetch(`${apiBase}/api/frikimusic/search?q=${encodeURIComponent(query)}`);
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || 'La búsqueda no respondió.');
+    const data = await fetchApiJson(`/api/frikimusic/search?q=${encodeURIComponent(query)}`);
     const tracks = (data.songs || []).map(normalizeTrack).filter(Boolean);
     if (!tracks.length) throw new Error('No encontramos una versión reproducible de esa canción.');
     tracks.forEach((track) => remoteTracks.set(track.id, track));
