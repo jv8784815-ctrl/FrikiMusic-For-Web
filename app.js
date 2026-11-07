@@ -73,6 +73,18 @@ const state = {
   followed: new Set(),
   shuffle: false,
   repeat: false,
+  queue: [],
+  searchSongs: [],
+  searchArtists: [],
+  searchResultsFor: '',
+  artistSongs: [],
+  remoteArtist: null,
+  artistLoading: false,
+  searchLoading: false,
+  searchError: '',
+  searchRequest: 0,
+  searchTimer: null,
+  artistRequest: 0,
   toastTimer: null,
 };
 
@@ -82,6 +94,11 @@ const pageContent = $('#pageContent');
 const globalSearch = $('#globalSearch');
 const toastNode = $('#toast');
 const fullPlayer = $('#fullPlayer');
+const audioPlayer = $('#audioPlayer');
+const apiBase = String(window.FRIKIMUSIC_API_URL || '').replace(/\/+$/, '');
+const remoteTracks = new Map();
+const remoteArtists = new Map();
+const coverTones = ['plum', 'rose', 'blue', 'amber', 'mint', 'violet', 'berry', 'night'];
 
 function durationText(seconds) {
   const minutes = Math.floor(seconds / 60);
@@ -89,26 +106,83 @@ function durationText(seconds) {
   return `${minutes}:${remainder}`;
 }
 
-function artistById(id) { return artists.find((artist) => artist.id === id) || artists[0]; }
-function trackById(id) { return songs.find((song) => song.id === id) || songs[0]; }
+function artistById(id) { return remoteArtists.get(id) || artists.find((artist) => artist.id === id) || artists[0]; }
+function trackById(id) { return remoteTracks.get(id) || songs.find((song) => song.id === id) || songs[0]; }
 function currentTrack() { return trackById(state.trackId); }
 
+function imageUrl(item) {
+  const image = item?.thumbnail || item?.thumbnails || item?.avatar || item?.image;
+  if (typeof image === 'string') return image;
+  if (Array.isArray(image)) return image.at(-1)?.url || image.at(-1)?.src || '';
+  return image?.url || image?.src || '';
+}
+
+function parseDuration(value) {
+  if (Number.isFinite(Number(value)) && Number(value) > 0) return Number(value);
+  if (typeof value !== 'string') return 0;
+  const parts = value.split(':').map(Number);
+  if (!parts.length || parts.some((part) => !Number.isFinite(part))) return 0;
+  return parts.reduce((total, part) => total * 60 + part, 0);
+}
+
+function normalizeArtist(item, index = 0) {
+  const id = String(item?.browseId || item?.id || item?.channelId || item?.artistId || '');
+  const name = String(item?.title || item?.name || item?.artist || 'Artista');
+  if (!id) return null;
+  return {
+    id,
+    name,
+    initials: name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase(),
+    tone: coverTones[index % coverTones.length],
+    thumbnail: imageUrl(item),
+    listeners: item?.monthlyListenerCount || item?.subscriberCountText || '—',
+    bio: item?.description || `Descubre canciones de ${name} en FrikiMusic.`,
+    youtube: true,
+  };
+}
+
+function normalizeTrack(item, index = 0) {
+  const videoId = String(item?.videoId || item?.id || item?.video_id || '');
+  if (!/^[\w-]{11}$/.test(videoId)) return null;
+  const artistList = Array.isArray(item?.artists) ? item.artists : item?.artist ? [item.artist] : [];
+  const leadArtist = artistList[0] || item?.author || {};
+  const artistName = String(leadArtist?.name || item?.artistName || item?.author?.name || 'Artista');
+  const artistId = String(leadArtist?.browseId || leadArtist?.id || leadArtist?.channelId || item?.artistId || '');
+  const albumValue = item?.album?.name || item?.album?.title || item?.album || 'Sencillo';
+  return {
+    id: videoId,
+    videoId,
+    title: String(item?.title || item?.name || 'Sin título'),
+    artist: artistName,
+    artistId,
+    album: String(albumValue),
+    duration: parseDuration(item?.duration || item?.durationSeconds || item?.lengthSeconds),
+    tone: coverTones[index % coverTones.length],
+    stamp: artistName.slice(0, 10),
+    plays: item?.views || item?.viewsText || '—',
+    thumbnail: imageUrl(item),
+    youtube: true,
+  };
+}
+
 function artwork(song, extra = '') {
+  if (song.thumbnail) return `<span class="artwork artwork--remote ${extra}" aria-hidden="true"><img class="artwork-image" src="${escapeHtml(song.thumbnail)}" alt="" loading="lazy" /></span>`;
   const stamp = song.stamp || song.title?.slice(0, 5) || 'FM';
-  return `<span class="artwork artwork--${song.tone || 'plum'} ${extra}" aria-hidden="true"><span class="art-disc"></span><span class="art-wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span><span class="art-stamp">${stamp}</span><span class="art-subtitle">FrikiMusic sessions</span></span>`;
+  return `<span class="artwork artwork--${song.tone || 'plum'} ${extra}" aria-hidden="true"><span class="art-disc"></span><span class="art-wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span><span class="art-stamp">${escapeHtml(stamp)}</span><span class="art-subtitle">FrikiMusic sessions</span></span>`;
 }
 
 function artistAvatar(artist, extra = '') {
-  return `<span class="artist-avatar avatar-tone--${artist.tone} ${extra}" aria-hidden="true"><span>${artist.initials}</span></span>`;
+  if (artist.thumbnail) return `<span class="artist-avatar artist-avatar--image ${extra}" aria-hidden="true"><img class="artist-avatar-image" src="${escapeHtml(artist.thumbnail)}" alt="" loading="lazy" /></span>`;
+  return `<span class="artist-avatar avatar-tone--${artist.tone || 'plum'} ${extra}" aria-hidden="true"><span>${escapeHtml(artist.initials)}</span></span>`;
 }
 
 function trackRow(song, index, extraClass = '') {
   const isCurrent = song.id === state.trackId;
   const liked = state.liked.has(song.id);
-  return `<div class="track-row ${isCurrent ? 'is-current' : ''} ${extraClass}" data-track-row="${song.id}" data-action="play-track" role="button" tabindex="0" aria-label="Reproducir ${song.title} de ${song.artist}">
+  return `<div class="track-row ${isCurrent ? 'is-current' : ''} ${extraClass}" data-track-row="${escapeHtml(song.id)}" data-action="play-track" role="button" tabindex="0" aria-label="Reproducir ${escapeHtml(song.title)} de ${escapeHtml(song.artist)}">
     <div class="track-number">${isCurrent && state.playing ? '<span class="playing-bars"><i></i><i></i><i></i></span>' : `<span>${String(index + 1).padStart(2, '0')}</span>`}<button class="row-play" aria-label="Reproducir">${icon('play')}</button></div>
-    <div class="track-main">${artwork(song)}<span class="track-copy"><strong>${song.title}</strong><small><button class="text-link" data-action="artist" data-artist="${song.artistId}">${song.artist}</button></small></span></div>
-    <span class="track-album">${song.album}</span><span class="track-date">${song.plays} reproducciones</span><span class="track-duration">${durationText(song.duration)}</span>
+    <div class="track-main">${artwork(song)}<span class="track-copy"><strong>${escapeHtml(song.title)}</strong><small><button class="text-link" data-action="artist" data-artist="${escapeHtml(song.artistId)}">${escapeHtml(song.artist)}</button></small></span></div>
+    <span class="track-album">${escapeHtml(song.album)}</span><span class="track-date">${escapeHtml(song.plays)} reproducciones</span><span class="track-duration">${durationText(song.duration)}</span>
     <button class="track-like ${liked ? 'liked' : ''}" data-action="like-track" data-track="${song.id}" aria-label="${liked ? 'Quitar de favoritos' : 'Añadir a favoritos'}">${icon('heart')}</button>
   </div>`;
 }
@@ -119,11 +193,11 @@ function sectionHeading(title, subtitle = '', actionLabel = 'Ver todo', action =
 }
 
 function musicCard(song, subtitle = null) {
-  return `<article class="music-card"><button class="music-card-art" data-action="play-track" data-track="${song.id}" aria-label="Reproducir ${song.title}">${artwork(song)}<span class="art-play">${icon('play')}</span></button><h3>${song.title}</h3><p>${subtitle || `<button class="text-link" data-action="artist" data-artist="${song.artistId}">${song.artist}</button>`}</p></article>`;
+  return `<article class="music-card"><button class="music-card-art" data-action="play-track" data-track="${escapeHtml(song.id)}" aria-label="Reproducir ${escapeHtml(song.title)}">${artwork(song)}<span class="art-play">${icon('play')}</span></button><h3>${escapeHtml(song.title)}</h3><p>${subtitle || `<button class="text-link" data-action="artist" data-artist="${escapeHtml(song.artistId)}">${escapeHtml(song.artist)}</button>`}</p></article>`;
 }
 
 function artistCard(artist) {
-  return `<button class="artist-card" data-action="artist" data-artist="${artist.id}">${artistAvatar(artist)}<strong>${artist.name}</strong><small>Artista</small></button>`;
+  return `<button class="artist-card" data-action="artist" data-artist="${escapeHtml(artist.id)}">${artistAvatar(artist)}<strong>${escapeHtml(artist.name)}</strong><small>Artista</small></button>`;
 }
 
 function playlistCard(list) {
@@ -158,19 +232,70 @@ function renderArtists() {
 
 function renderSearch() {
   const query = state.search.trim().toLocaleLowerCase('es');
-  const matchedSongs = query ? songs.filter((song) => `${song.title} ${song.artist} ${song.album}`.toLocaleLowerCase('es').includes(query)) : songs.slice(0, 5);
-  const matchedArtists = query ? artists.filter((artist) => artist.name.toLocaleLowerCase('es').includes(query)) : artists.slice(0, 4);
+  const hasRemoteResults = Boolean(apiBase && query.length >= 2 && state.searchResultsFor === query);
+  const matchedSongs = hasRemoteResults ? state.searchSongs : query ? songs.filter((song) => `${song.title} ${song.artist} ${song.album}`.toLocaleLowerCase('es').includes(query)) : songs.slice(0, 5);
+  const matchedArtists = hasRemoteResults ? state.searchArtists : query ? artists.filter((artist) => artist.name.toLocaleLowerCase('es').includes(query)) : artists.slice(0, 4);
   const matchedAlbums = query ? [...new Map(matchedSongs.map((song) => [song.album, song])).values()] : [songs[0], songs[3], songs[5], songs[8]];
+  const waiting = Boolean(apiBase && query.length >= 2 && state.searchResultsFor !== query);
   const tabs = [['tracks', 'Canciones'], ['artists', 'Artistas'], ['albums', 'Álbumes']];
   let primaryResults = '';
-  if (state.searchTab === 'tracks') primaryResults = matchedSongs.length ? `<div class="track-list">${matchedSongs.map(trackRow).join('')}</div>` : emptyState('No encontramos canciones', 'Prueba con otro título o artista.');
-  if (state.searchTab === 'artists') primaryResults = matchedArtists.length ? `<div class="artist-directory">${matchedArtists.map((artist) => `<button class="result-artist" data-action="artist" data-artist="${artist.id}">${artistAvatar(artist)}<span class="result-artist-copy"><strong>${artist.name}</strong><small>Artista · ${artist.listeners} oyentes mensuales</small></span>${icon('arrow')}</button>`).join('')}</div>` : emptyState('No encontramos artistas', 'Intenta con otro nombre.');
+  if (state.searchTab === 'tracks') primaryResults = waiting || state.searchLoading ? `<div class="empty-state"><h3>Buscando en YouTube Music…</h3><p>Un momento, estamos trayendo canciones para reproducir.</p></div>` : state.searchError && hasRemoteResults ? emptyState('No se pudo conectar', escapeHtml(state.searchError)) : matchedSongs.length ? `<div class="track-list">${matchedSongs.map(trackRow).join('')}</div>` : emptyState('No encontramos canciones', 'Prueba con otro título o artista.');
+  if (state.searchTab === 'artists') primaryResults = waiting || state.searchLoading ? `<div class="empty-state"><h3>Buscando artistas…</h3><p>Estamos cargando coincidencias.</p></div>` : matchedArtists.length ? `<div class="artist-directory">${matchedArtists.map((artist) => `<button class="result-artist" data-action="artist" data-artist="${escapeHtml(artist.id)}">${artistAvatar(artist)}<span class="result-artist-copy"><strong>${escapeHtml(artist.name)}</strong><small>Artista · ${escapeHtml(artist.listeners)} oyentes mensuales</small></span>${icon('arrow')}</button>`).join('')}</div>` : emptyState('No encontramos artistas', 'Intenta con otro nombre.');
   if (state.searchTab === 'albums') primaryResults = matchedAlbums.length ? `<div class="card-grid">${matchedAlbums.map((song) => musicCard(song, song.album)).join('')}</div>` : emptyState('No encontramos álbumes', 'Prueba con otro título o artista.');
   return `<div class="search-intro"><div class="page-eyebrow">BUSCA ALGO QUE TE MUEVA</div><h1>¿Qué quieres escuchar?</h1><p>Encuentra canciones y artistas para tu siguiente descubrimiento.</p></div>
     <label class="search-field-large">${icon('search')}<input id="searchPageInput" type="search" value="${escapeHtml(state.search)}" placeholder="Canciones, artistas, álbumes..." autocomplete="off" /><span class="search-shortcut">ENTER</span></label>
     <div class="search-tabs">${tabs.map(([id, label]) => `<button class="search-tab ${state.searchTab === id ? 'active' : ''}" data-action="search-tab" data-tab="${id}">${label}</button>`).join('')}</div>
     ${query ? `<div class="search-summary">Resultados para <strong>“${escapeHtml(state.search)}”</strong></div>` : `<div class="search-summary">Tendencias de la semana</div>`}
-    <div class="search-results"><section class="results-column"><h2>${state.searchTab === 'tracks' ? 'Canciones' : state.searchTab === 'artists' ? 'Artistas' : 'Álbumes'}</h2>${primaryResults}</section><aside class="results-column"><h2>Artistas</h2>${matchedArtists.length ? matchedArtists.slice(0, 4).map((artist) => `<button class="result-artist" data-action="artist" data-artist="${artist.id}">${artistAvatar(artist)}<span class="result-artist-copy"><strong>${artist.name}</strong><small>Artista</small></span>${icon('arrow')}</button>`).join('') : `<p class="muted-copy">Prueba otra búsqueda para encontrar artistas.</p>`}</aside></div>`;
+    <div class="search-results"><section class="results-column"><h2>${state.searchTab === 'tracks' ? 'Canciones' : state.searchTab === 'artists' ? 'Artistas' : 'Álbumes'}</h2>${primaryResults}</section><aside class="results-column"><h2>Artistas</h2>${matchedArtists.length ? matchedArtists.slice(0, 4).map((artist) => `<button class="result-artist" data-action="artist" data-artist="${escapeHtml(artist.id)}">${artistAvatar(artist)}<span class="result-artist-copy"><strong>${escapeHtml(artist.name)}</strong><small>Artista</small></span>${icon('arrow')}</button>`).join('') : `<p class="muted-copy">Prueba otra búsqueda para encontrar artistas.</p>`}</aside></div>`;
+}
+
+async function loadSearchResults(query) {
+  const normalizedQuery = query.trim().toLocaleLowerCase('es');
+  if (!apiBase || normalizedQuery.length < 2) return;
+  const request = ++state.searchRequest;
+  state.searchLoading = true;
+  state.searchError = '';
+  renderPage();
+  try {
+    const response = await fetch(`${apiBase}/api/frikimusic/search?q=${encodeURIComponent(query.trim())}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'La búsqueda no respondió.');
+    if (request !== state.searchRequest) return;
+    state.searchSongs = (data.songs || []).map(normalizeTrack).filter(Boolean);
+    state.searchArtists = (data.artists || []).map(normalizeArtist).filter(Boolean);
+    state.searchSongs.forEach((song) => {
+      remoteTracks.set(song.id, song);
+      if (song.artistId && !remoteArtists.has(song.artistId)) remoteArtists.set(song.artistId, normalizeArtist({ id: song.artistId, title: song.artist }, remoteArtists.size));
+    });
+    state.searchArtists.forEach((artist) => remoteArtists.set(artist.id, artist));
+    state.searchResultsFor = normalizedQuery;
+  } catch (error) {
+    if (request !== state.searchRequest) return;
+    state.searchSongs = [];
+    state.searchArtists = [];
+    state.searchResultsFor = normalizedQuery;
+    state.searchError = error.message || 'Revisa que la API del VPS esté disponible.';
+  } finally {
+    if (request === state.searchRequest) {
+      state.searchLoading = false;
+      if (state.page === 'search') renderPage();
+    }
+  }
+}
+
+function scheduleSearch(query) {
+  clearTimeout(state.searchTimer);
+  if (query.trim().length < 2) {
+    state.searchRequest++;
+    state.searchLoading = false;
+    state.searchResultsFor = '';
+    state.searchSongs = [];
+    state.searchArtists = [];
+    state.searchError = '';
+    return;
+  }
+  if (!apiBase) return;
+  state.searchTimer = setTimeout(() => loadSearchResults(query), 350);
 }
 
 function emptyState(title, description) {
@@ -186,16 +311,52 @@ function renderLibrary() {
 }
 
 function renderArtistPage(id) {
-  const artist = artistById(id);
-  const artistSongs = songs.filter((song) => song.artistId === artist.id);
-  const firstSong = artistSongs[0] || songs[0];
+  const artist = state.remoteArtist?.id === id ? state.remoteArtist : artistById(id);
+  const isRemoteArtist = state.remoteArtist?.id === id;
+  const artistSongs = isRemoteArtist ? state.artistSongs : songs.filter((song) => song.artistId === artist.id);
+  const displaySongs = artistSongs.length ? artistSongs : isRemoteArtist ? [] : [songs[0]];
+  const firstSong = displaySongs[0] || null;
   const following = state.followed.has(artist.id);
-  return `<section class="artist-hero artist-hero--${artist.tone}"><div class="artist-hero-content">${artistAvatar(artist)}<div class="artist-meta"><div class="verified-line"><span class="verified-check">${icon('check')}</span> Artista verificado</div><h1>${artist.name}</h1><p>${artist.listeners} oyentes mensuales</p></div></div></section>
-    <div class="artist-actions"><button class="button button-primary" data-action="play-track" data-track="${firstSong.id}">${icon('play')} Reproducir</button><button class="button artist-follow ${following ? 'following' : ''}" data-action="follow" data-artist="${artist.id}">${following ? 'Siguiendo' : 'Seguir'}</button><button class="icon-button" data-action="toast" data-message="Más opciones de artista" aria-label="Más opciones">${icon('more')}</button><div class="artist-stats"><span><strong>${artist.listeners}</strong> oyentes mensuales</span><span><strong>${artistSongs.length || 1}</strong> canciones en la selección</span></div></div>
-    <div class="artist-page-grid"><section>${sectionHeading('Más populares', `Lo más escuchado de ${artist.name}.`, 'Reproducir todo', 'play-artist')}
-      <div class="track-list">${(artistSongs.length ? artistSongs : [firstSong]).map(trackRow).join('')}</div>
-      ${sectionHeading('Lanzamientos que te pueden gustar', '', 'Ver discografía', 'toast')}<div class="card-grid">${(artistSongs.length ? artistSongs : [firstSong]).map((song) => musicCard(song, song.album)).join('')}</div></section>
-      <aside><div class="artist-about"><h3>Sobre ${artist.name}</h3><p>${artist.bio}</p><div class="about-stat">${icon('headphones')} ${artist.listeners} oyentes cada mes</div></div></aside></div>`;
+  if (state.artistLoading && state.remoteArtist?.id !== id) return `<div class="page-eyebrow">PERFIL DE ARTISTA</div><div class="empty-state"><h3>Cargando ${escapeHtml(artist.name)}…</h3><p>Buscando sus canciones y detalles.</p></div>`;
+  return `<section class="artist-hero artist-hero--${artist.tone}"><div class="artist-hero-content">${artistAvatar(artist)}<div class="artist-meta"><div class="verified-line"><span class="verified-check">${icon('check')}</span> Artista verificado</div><h1>${escapeHtml(artist.name)}</h1><p>${escapeHtml(artist.listeners)} oyentes mensuales</p></div></div></section>
+    <div class="artist-actions">${firstSong ? `<button class="button button-primary" data-action="play-track" data-track="${escapeHtml(firstSong.id)}">${icon('play')} Reproducir</button>` : `<button class="button button-primary" disabled>${icon('play')} Sin canciones</button>`}<button class="button artist-follow ${following ? 'following' : ''}" data-action="follow" data-artist="${escapeHtml(artist.id)}">${following ? 'Siguiendo' : 'Seguir'}</button><button class="icon-button" data-action="toast" data-message="Más opciones de artista" aria-label="Más opciones">${icon('more')}</button><div class="artist-stats"><span><strong>${escapeHtml(artist.listeners)}</strong> oyentes mensuales</span><span><strong>${artistSongs.length}</strong> canciones en la selección</span></div></div>
+    <div class="artist-page-grid"><section>${sectionHeading('Más populares', `Lo más escuchado de ${escapeHtml(artist.name)}.`, 'Reproducir todo', 'play-artist')}
+      <div class="track-list">${displaySongs.length ? displaySongs.map(trackRow).join('') : emptyState('Todavía no hay canciones aquí', 'Prueba con otro artista o vuelve a buscar más tarde.')}</div>
+      ${sectionHeading('Lanzamientos que te pueden gustar', '', 'Ver discografía', 'toast')}<div class="card-grid">${displaySongs.map((song) => musicCard(song, song.album)).join('')}</div></section>
+      <aside><div class="artist-about"><h3>Sobre ${escapeHtml(artist.name)}</h3><p>${escapeHtml(artist.bio)}</p><div class="about-stat">${icon('headphones')} ${escapeHtml(artist.listeners)} oyentes cada mes</div></div></aside></div>`;
+}
+
+async function loadArtist(id) {
+  if (!apiBase || !id || !remoteArtists.has(id) || (state.remoteArtist?.id === id && state.artistSongs.length)) return;
+  if (state.artistLoading && state.artistId === id) return;
+  const request = ++state.artistRequest;
+  state.artistLoading = true;
+  renderPage();
+  try {
+    const response = await fetch(`${apiBase}/api/frikimusic/artist/${encodeURIComponent(id)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'No se pudo cargar este perfil.');
+    if (request !== state.artistRequest || state.artistId !== id) return;
+    const details = data.artist || data;
+    const artist = normalizeArtist({ ...remoteArtists.get(id), ...details, id }, remoteArtists.size);
+    if (artist) remoteArtists.set(id, artist);
+    const sections = Array.isArray(data.sections) ? data.sections : [];
+    const items = [...sections.flatMap((section) => section.items || section.contents || []), ...(data.songs || data.tracks || [])];
+    const tracks = items.map((item, index) => normalizeTrack({ ...item, artists: item.artists?.length ? item.artists : [{ id, name: artist?.name }] }, index)).filter(Boolean);
+    state.remoteArtist = artist;
+    state.artistSongs = [...new Map(tracks.map((track) => [track.id, track])).values()];
+    state.artistSongs.forEach((track) => remoteTracks.set(track.id, track));
+  } catch (error) {
+    if (request !== state.artistRequest) return;
+    state.remoteArtist = remoteArtists.get(id);
+    state.artistSongs = [];
+    showToast(error.message || 'No se pudo cargar el perfil.');
+  } finally {
+    if (request === state.artistRequest) {
+      state.artistLoading = false;
+      if (state.page === 'artist' && state.artistId === id) renderPage();
+    }
+  }
 }
 
 function escapeHtml(value) {
@@ -220,6 +381,7 @@ function renderPage() {
       const nextInput = $('#searchPageInput');
       nextInput?.focus();
       nextInput?.setSelectionRange(position, position);
+      scheduleSearch(state.search);
     });
   }
 }
@@ -235,6 +397,7 @@ function navigate(page, artistId = null) {
   const hash = page === 'artist' ? `#artist/${artistId}` : `#${page}`;
   if (location.hash !== hash) location.hash = hash;
   else renderPage();
+  if (page === 'artist' && artistId && remoteArtists.has(artistId)) loadArtist(artistId);
   $('#pageContent')?.focus({ preventScroll: true });
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
@@ -245,6 +408,7 @@ function readRoute() {
   else if (['home', 'search', 'artists', 'library'].includes(page)) state.page = page;
   else state.page = 'home';
   renderPage();
+  if (state.page === 'artist') loadArtist(state.artistId);
 }
 
 function showToast(message) {
@@ -266,13 +430,14 @@ function syncPlayer() {
   const artistButton = $('#nowArtist');
   artistButton.textContent = song.artist;
   artistButton.dataset.artist = song.artistId;
-  $('#miniArtwork').className = `artwork artwork--${song.tone}`;
-  $('#miniArtwork').innerHTML = `<span class="art-disc"></span><span class="art-wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span><span class="art-stamp">${song.stamp}</span>`;
+  $('#miniArtwork').className = `artwork artwork--${song.tone || 'plum'} ${song.thumbnail ? 'artwork--remote' : ''}`;
+  $('#miniArtwork').innerHTML = song.thumbnail ? `<img class="artwork-image" src="${escapeHtml(song.thumbnail)}" alt="" />` : `<span class="art-disc"></span><span class="art-wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span><span class="art-stamp">${escapeHtml(song.stamp)}</span>`;
   $('#playButton').innerHTML = icon(state.playing ? 'pause' : 'play');
   $('#playButton').setAttribute('aria-label', state.playing ? 'Pausar' : 'Reproducir');
   $('#currentTime').textContent = durationText(state.progress);
-  $('#duration').textContent = durationText(song.duration);
-  setRange($('#seekBar'), (state.progress / song.duration) * 100);
+  const duration = Number.isFinite(audioPlayer.duration) && audioPlayer.duration > 0 ? audioPlayer.duration : song.duration;
+  $('#duration').textContent = durationText(duration);
+  setRange($('#seekBar'), duration ? (state.progress / duration) * 100 : 0);
   $('#likeButton').classList.toggle('liked', state.liked.has(song.id));
   $$('[data-action="shuffle"]').forEach((button) => button.classList.toggle('active', state.shuffle));
   $$('[data-action="repeat"]').forEach((button) => button.classList.toggle('active', state.repeat));
@@ -290,26 +455,77 @@ function updateNowPlayingRow() {
 }
 
 function playTrack(id) {
-  if (id && id !== state.trackId) {
-    state.trackId = id;
-    state.progress = 0;
-  }
+  const song = trackById(id);
+  if (!song.youtube) return findAndPlay(song);
+  const candidateQueue = state.page === 'artist' && state.artistSongs.length ? state.artistSongs : state.searchSongs;
+  state.queue = candidateQueue.some((track) => track.id === song.id) ? candidateQueue.map((track) => track.id) : [song.id];
+  if (!state.queue.includes(song.id)) state.queue.unshift(song.id);
+  state.trackId = song.id;
+  state.progress = 0;
   state.playing = true;
+  audioPlayer.pause();
+  audioPlayer.dataset.trackId = song.id;
+  if (!apiBase) {
+    state.playing = false;
+    syncPlayer();
+    showToast('Configura la dirección HTTPS de la API de FrikiMusic para escuchar canciones.');
+    return;
+  }
+  audioPlayer.src = `${apiBase}/api/frikimusic/stream/${encodeURIComponent(song.videoId)}`;
+  audioPlayer.load();
   syncPlayer();
+  audioPlayer.play().catch(() => {
+    state.playing = false;
+    syncPlayer();
+    showToast('No se pudo reproducir. Comprueba la API del VPS y vuelve a intentar.');
+  });
+}
+
+async function findAndPlay(sample) {
+  if (!apiBase) {
+    showToast('Configura la dirección HTTPS de la API de FrikiMusic para escuchar canciones.');
+    return;
+  }
+  showToast(`Buscando “${sample.title}” para reproducir…`);
+  try {
+    const query = `${sample.title} ${sample.artist}`;
+    const response = await fetch(`${apiBase}/api/frikimusic/search?q=${encodeURIComponent(query)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'La búsqueda no respondió.');
+    const tracks = (data.songs || []).map(normalizeTrack).filter(Boolean);
+    if (!tracks.length) throw new Error('No encontramos una versión reproducible de esa canción.');
+    tracks.forEach((track) => remoteTracks.set(track.id, track));
+    state.searchSongs = tracks;
+    state.searchArtists = (data.artists || []).map(normalizeArtist).filter(Boolean);
+    state.searchResultsFor = query.toLocaleLowerCase('es');
+    playTrack(tracks[0].id);
+  } catch (error) {
+    showToast(error.message || 'No se pudo buscar esta canción.');
+  }
 }
 
 function togglePlay() {
-  state.playing = !state.playing;
-  syncPlayer();
+  if (audioPlayer.currentSrc && audioPlayer.dataset.trackId === state.trackId) {
+    if (audioPlayer.paused) audioPlayer.play().catch(() => showToast('No se pudo reanudar la reproducción.'));
+    else audioPlayer.pause();
+    return;
+  }
+  playTrack(state.trackId);
 }
 
 function changeTrack(direction) {
-  const index = songs.findIndex((song) => song.id === state.trackId);
-  const nextIndex = (index + direction + songs.length) % songs.length;
-  state.trackId = songs[nextIndex].id;
+  const queue = state.queue.length ? [...state.queue] : [state.trackId];
+  if (!queue.includes(state.trackId)) queue.unshift(state.trackId);
+  const index = queue.indexOf(state.trackId);
+  let nextIndex = (index + direction + queue.length) % queue.length;
+  if (state.shuffle && queue.length > 1) {
+    do { nextIndex = Math.floor(Math.random() * queue.length); } while (nextIndex === index);
+  }
+  const track = trackById(queue[nextIndex]);
+  state.queue = queue;
+  state.trackId = track.id;
   state.progress = 0;
-  state.playing = true;
-  syncPlayer();
+  playTrack(track.id);
 }
 
 function toggleLike(id = state.trackId) {
@@ -335,9 +551,10 @@ function closeFullPlayer() {
 function renderFullPlayer() {
   const song = currentTrack();
   const artist = artistById(song.artistId);
-  const progress = (state.progress / song.duration) * 100;
-  fullPlayer.innerHTML = `<div class="full-player-top"><button class="icon-button" data-action="close-player" aria-label="Cerrar">${icon('close')}</button><span>REPRODUCIENDO DESDE · TU MEZCLA DIARIA</span><button class="icon-button" data-action="queue" aria-label="Abrir cola">${icon('queue')}</button></div>
-    <div class="full-player-body"><div class="full-art">${artwork(song)}</div><div class="full-copy"><div class="page-eyebrow">AHORA SUENA</div><h1>${song.title}</h1><button class="text-link full-artist" data-action="artist" data-artist="${artist.id}">${artist.name}</button><div class="full-player-timeline"><div class="timeline"><span id="fullCurrentTime">${durationText(state.progress)}</span><input id="fullSeekBar" type="range" min="0" max="100" value="${progress}" style="--range:${progress}%" aria-label="Posición de reproducción" /><span>${durationText(song.duration)}</span></div></div><div class="full-player-controls"><button class="icon-button ${state.shuffle ? 'active' : ''}" data-action="shuffle" aria-label="Aleatorio">${icon('shuffle')}</button><button class="icon-button" data-action="previous" aria-label="Anterior">${icon('previous')}</button><button class="play-button" data-action="toggle-play" aria-label="${state.playing ? 'Pausar' : 'Reproducir'}">${icon(state.playing ? 'pause' : 'play')}</button><button class="icon-button" data-action="next" aria-label="Siguiente">${icon('next')}</button><button class="icon-button ${state.repeat ? 'active' : ''}" data-action="repeat" aria-label="Repetir">${icon('repeat')}</button></div><p class="full-player-footnote">Esta vista previa muestra la interfaz de FrikiMusic. El audio se conectará al reproductor cuando se integre el backend.</p></div></div>`;
+  const duration = Number.isFinite(audioPlayer.duration) && audioPlayer.duration > 0 ? audioPlayer.duration : song.duration;
+  const progress = duration ? (state.progress / duration) * 100 : 0;
+  fullPlayer.innerHTML = `<div class="full-player-top"><button class="icon-button" data-action="close-player" aria-label="Cerrar">${icon('close')}</button><span>REPRODUCIENDO DESDE · FRIKIMUSIC</span><button class="icon-button" data-action="queue" aria-label="Abrir cola">${icon('queue')}</button></div>
+    <div class="full-player-body"><div class="full-art">${artwork(song)}</div><div class="full-copy"><div class="page-eyebrow">AHORA SUENA</div><h1>${escapeHtml(song.title)}</h1><button class="text-link full-artist" data-action="artist" data-artist="${escapeHtml(artist.id)}">${escapeHtml(artist.name)}</button><div class="full-player-timeline"><div class="timeline"><span id="fullCurrentTime">${durationText(state.progress)}</span><input id="fullSeekBar" type="range" min="0" max="100" value="${progress}" style="--range:${progress}%" aria-label="Posición de reproducción" /><span>${durationText(duration)}</span></div></div><div class="full-player-controls"><button class="icon-button ${state.shuffle ? 'active' : ''}" data-action="shuffle" aria-label="Aleatorio">${icon('shuffle')}</button><button class="icon-button" data-action="previous" aria-label="Anterior">${icon('previous')}</button><button class="play-button" data-action="toggle-play" aria-label="${state.playing ? 'Pausar' : 'Reproducir'}">${icon(state.playing ? 'pause' : 'play')}</button><button class="icon-button" data-action="next" aria-label="Siguiente">${icon('next')}</button><button class="icon-button ${state.repeat ? 'active' : ''}" data-action="repeat" aria-label="Repetir">${icon('repeat')}</button></div><p class="full-player-footnote">Reproducción progresiva desde FrikiMusic.</p></div></div>`;
 }
 
 function handleAction(actionNode) {
@@ -351,7 +568,7 @@ function handleAction(actionNode) {
     case 'route-search': navigate('search'); break;
     case 'play-track': playTrack(trackId || state.trackId); break;
     case 'play-artist': {
-      const first = songs.find((song) => song.artistId === state.artistId);
+      const first = state.artistSongs[0] || songs.find((song) => song.artistId === state.artistId);
       playTrack(first?.id || state.trackId);
       break;
     }
@@ -404,6 +621,8 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && event.target.id === 'searchPageInput') {
     state.search = event.target.value.trim();
     renderPage();
+    clearTimeout(state.searchTimer);
+    loadSearchResults(state.search);
   }
 });
 
@@ -411,37 +630,75 @@ globalSearch.addEventListener('input', () => {
   state.search = globalSearch.value;
   if (state.page !== 'search') navigate('search');
   else renderPage();
+  scheduleSearch(state.search);
 });
 
 document.addEventListener('input', (event) => {
   if (event.target.id === 'seekBar' || event.target.id === 'fullSeekBar') {
-    state.progress = Math.round((Number(event.target.value) / 100) * currentTrack().duration);
-    setRange($('#seekBar'), (state.progress / currentTrack().duration) * 100);
+    const duration = Number.isFinite(audioPlayer.duration) && audioPlayer.duration > 0 ? audioPlayer.duration : currentTrack().duration;
+    state.progress = Math.round((Number(event.target.value) / 100) * duration);
+    if (Number.isFinite(audioPlayer.duration) && audioPlayer.duration > 0) audioPlayer.currentTime = state.progress;
+    setRange($('#seekBar'), duration ? (state.progress / duration) * 100 : 0);
     $('#currentTime').textContent = durationText(state.progress);
     if ($('#fullCurrentTime')) $('#fullCurrentTime').textContent = durationText(state.progress);
     if ($('#fullSeekBar')) setRange($('#fullSeekBar'), (state.progress / currentTrack().duration) * 100);
   }
-  if (event.target.classList.contains('volume-slider')) setRange(event.target, Number(event.target.value));
+  if (event.target.classList.contains('volume-slider')) {
+    setRange(event.target, Number(event.target.value));
+    audioPlayer.volume = Number(event.target.value) / 100;
+  }
+});
+
+audioPlayer.volume = Number($('.volume-slider')?.value || 72) / 100;
+audioPlayer.addEventListener('play', () => {
+  state.playing = true;
+  syncPlayer();
+});
+audioPlayer.addEventListener('pause', () => {
+  state.playing = false;
+  syncPlayer();
+});
+audioPlayer.addEventListener('loadedmetadata', () => {
+  const song = currentTrack();
+  if (Number.isFinite(audioPlayer.duration) && audioPlayer.duration > 0) song.duration = audioPlayer.duration;
+  syncPlayer();
+});
+audioPlayer.addEventListener('timeupdate', () => {
+  state.progress = audioPlayer.currentTime || 0;
+  const duration = Number.isFinite(audioPlayer.duration) && audioPlayer.duration > 0 ? audioPlayer.duration : currentTrack().duration;
+  $('#currentTime').textContent = durationText(state.progress);
+  $('#duration').textContent = durationText(duration);
+  setRange($('#seekBar'), duration ? (state.progress / duration) * 100 : 0);
+  if ($('#fullCurrentTime')) $('#fullCurrentTime').textContent = durationText(state.progress);
+  if ($('#fullSeekBar')) {
+    setRange($('#fullSeekBar'), duration ? (state.progress / duration) * 100 : 0);
+    const fullDuration = $('#fullSeekBar')?.parentElement?.lastElementChild;
+    if (fullDuration) fullDuration.textContent = durationText(duration);
+  }
+  updateNowPlayingRow();
+});
+audioPlayer.addEventListener('ended', () => {
+  if (state.repeat) {
+    audioPlayer.currentTime = 0;
+    audioPlayer.play().catch(() => showToast('No se pudo reiniciar esta canción.'));
+  } else if (state.queue.length > 1) changeTrack(1);
+  else {
+    state.playing = false;
+    state.progress = 0;
+    syncPlayer();
+  }
+});
+audioPlayer.addEventListener('error', () => {
+  if (!audioPlayer.src) return;
+  state.playing = false;
+  syncPlayer();
+  showToast('No se pudo cargar el audio. Revisa la API del VPS.');
 });
 
 window.addEventListener('hashchange', readRoute);
 if (!location.hash) history.replaceState(null, '', '#home');
 readRoute();
 syncPlayer();
-
-setInterval(() => {
-  if (!state.playing) return;
-  state.progress += 1;
-  if (state.progress >= currentTrack().duration) {
-    if (state.repeat) state.progress = 0;
-    else changeTrack(1);
-  }
-  $('#currentTime').textContent = durationText(state.progress);
-  setRange($('#seekBar'), (state.progress / currentTrack().duration) * 100);
-  if ($('#fullCurrentTime')) $('#fullCurrentTime').textContent = durationText(state.progress);
-  if ($('#fullSeekBar')) setRange($('#fullSeekBar'), (state.progress / currentTrack().duration) * 100);
-  updateNowPlayingRow();
-}, 1000);
 
 $$('[data-icon]').forEach((node) => {
   const name = node.dataset.icon;
